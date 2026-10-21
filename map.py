@@ -18,6 +18,7 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "mahalla.xlsx"
+COORDINATES_CSV = BASE_DIR / "mahalla_with_coordinates.csv"
 OUTPUT_FILE = BASE_DIR / "mahalla_map.html"
 SHEET_NAME = 0
 
@@ -62,6 +63,25 @@ def main() -> None:
         points["_district"] = "District not specified"
     points.loc[points["_district"] == "", "_district"] = "District not specified"
 
+    # The companion CSV includes the source URL for each district's polygons.
+    points["_boundary_url"] = ""
+    points["_boundary_name"] = ""
+    if COORDINATES_CSV.exists() and "KODUZKAD" in points.columns:
+        extra = pd.read_csv(
+            COORDINATES_CSV, encoding="utf-8-sig", dtype={"KODUZKAD": str}
+        )
+        needed = {"KODUZKAD", "COORD_SOURCE_URL", MATCHED_NAME_COL}
+        if needed.issubset(extra.columns):
+            extra["_join_code"] = extra["KODUZKAD"].map(clean_text)
+            source_rows = extra.drop_duplicates("_join_code").set_index("_join_code")
+            points["_join_code"] = points["KODUZKAD"].map(clean_text)
+            points["_boundary_url"] = points["_join_code"].map(
+                source_rows["COORD_SOURCE_URL"].to_dict()
+            ).fillna("")
+            points["_boundary_name"] = points["_join_code"].map(
+                source_rows[MATCHED_NAME_COL].to_dict()
+            ).fillna("")
+
     # Compact arrays keep the generated HTML reasonably small.
     records = []
     for _, row in points.iterrows():
@@ -77,6 +97,8 @@ def main() -> None:
                     clean_text(row.get(ALT_NAME_COL)),
                     clean_text(row.get(MATCHED_NAME_COL)),
                 ],
+                clean_text(row.get("_boundary_url")),
+                clean_text(row.get("_boundary_name")),
             ]
         )
 
@@ -116,7 +138,14 @@ def main() -> None:
     .suggestion:hover, .suggestion:focus {{ background: #f0f5fb; outline: none; }}
     .suggestion-name {{ display: block; font-size: 13px; color: #172b4d; }}
     .suggestion-detail {{ display: block; font-size: 11px; color: #697789; margin-top: 2px; }}
+    #mahalla-section {{ margin-top: 10px; border-top: 1px solid #e1e6ed; padding-top: 8px; }}
+    #mahalla-heading {{ font-size: 12px; color: #526174; margin-bottom: 5px; }}
+    #mahalla-names {{ max-height: 220px; overflow-y: auto; }}
+    .mahalla-choice {{ display: block; width: 100%; border: 0; border-radius: 3px;
+      padding: 6px 7px; background: white; text-align: left; cursor: pointer; font-size: 12px; }}
+    .mahalla-choice:hover, .mahalla-choice:focus {{ background: #f0f5fb; outline: none; }}
     #summary {{ color: #526174; font-size: 12px; margin-top: 7px; }}
+    #boundary-status {{ color: #526174; font-size: 12px; margin-top: 6px; }}
     .leaflet-popup-content {{ line-height: 1.5; }}
   </style>
 </head>
@@ -132,6 +161,11 @@ def main() -> None:
       {options}
     </select>
     <div id="summary">Loading coordinates…</div>
+    <div id="boundary-status"></div>
+    <section id="mahalla-section" hidden>
+      <div id="mahalla-heading"></div>
+      <div id="mahalla-names"></div>
+    </section>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
@@ -148,6 +182,13 @@ def main() -> None:
     const searchInput = document.getElementById('search');
     const suggestionsBox = document.getElementById('suggestions');
     const summary = document.getElementById('summary');
+    const boundaryStatus = document.getElementById('boundary-status');
+    const mahallaSection = document.getElementById('mahalla-section');
+    const mahallaHeading = document.getElementById('mahalla-heading');
+    const mahallaNames = document.getElementById('mahalla-names');
+    const boundaryCache = new Map();
+    let boundaryLayer = null;
+    let boundaryRequestId = 0;
     const esc = (value) => String(value).replace(/[&<>"']/g, ch => ({{
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }}[ch]));
@@ -164,6 +205,112 @@ def main() -> None:
         .normalize('NFKD').replace(/[\\u0300-\\u036f]/g, ''))
         .map(ch => cyrillicToLatin[ch] ?? ch)
         .join('').replace(/\\s+/g, ' ').trim();
+    }}
+
+    function clearBoundary() {{
+      boundaryRequestId++;
+      if (boundaryLayer) map.removeLayer(boundaryLayer);
+      boundaryLayer = null;
+      boundaryStatus.textContent = '';
+    }}
+
+    function parsePolygon(record) {{
+      if (!record || !record.geo_polygon) return null;
+      let geometry = record.geo_polygon;
+      if (typeof geometry === 'string') geometry = JSON.parse(geometry);
+      if (geometry && geometry.value) geometry = JSON.parse(geometry.value);
+      return geometry.type === 'Feature'
+        ? geometry
+        : {{ type: 'Feature', properties: {{ name: record.name }}, geometry }};
+    }}
+
+    async function getDistrictPolygons(sourceUrl) {{
+      const rawUrl = sourceUrl.replace('https://github.com/', 'https://raw.githubusercontent.com/')
+        .replace('/blob/', '/');
+      let districtData = boundaryCache.get(rawUrl);
+      if (!districtData) {{
+        const response = await fetch(rawUrl);
+        if (!response.ok) throw new Error(`Boundary request failed (${{response.status}})`);
+        districtData = await response.json();
+        boundaryCache.set(rawUrl, districtData);
+      }}
+      return districtData;
+    }}
+
+    async function showBoundary(mahallaName, districtName) {{
+      clearBoundary();
+      const requestId = boundaryRequestId;
+      const point = points.find(p => p[2] === mahallaName && p[3] === districtName);
+      if (!point || !point[7]) {{
+        boundaryStatus.textContent = 'No boundary source is available for this mahalla.';
+        return;
+      }}
+
+      boundaryStatus.textContent = 'Loading mahalla boundary…';
+      try {{
+        const districtData = await getDistrictPolygons(point[7]);
+        if (requestId !== boundaryRequestId) return;
+
+        const polygonRecord = (districtData.mahalla || []).find(feature =>
+          normalizeSearch(feature.name) === normalizeSearch(point[8] || mahallaName)
+        );
+        if (!polygonRecord || !polygonRecord.geo_polygon) {{
+          boundaryStatus.textContent = 'A boundary polygon was not found for this mahalla.';
+          return;
+        }}
+
+        const feature = parsePolygon(polygonRecord);
+        if (!feature) throw new Error('Invalid boundary polygon');
+        boundaryLayer = L.geoJSON(feature, {{
+          style: {{ color: '#f05a28', weight: 3, opacity: 1, fillColor: '#ff9f43', fillOpacity: 0.22 }}
+        }}).bindPopup(`<b>${{esc(mahallaName)}}</b><br>District: ${{esc(districtName)}}`).addTo(map);
+        const bounds = boundaryLayer.getBounds();
+        if (bounds.isValid()) map.fitBounds(bounds.pad(0.12));
+        boundaryStatus.textContent = 'Boundary shown for the selected mahalla.';
+      }} catch (error) {{
+        if (requestId === boundaryRequestId) {{
+          boundaryStatus.textContent = 'Could not load the boundary. Check your internet connection and try again.';
+          console.error('Mahalla boundary load failed:', error);
+        }}
+      }}
+    }}
+
+    async function showDistrictBoundary(districtName) {{
+      clearBoundary();
+      const requestId = boundaryRequestId;
+      const point = points.find(p => p[3] === districtName && p[7]);
+      if (!point) {{
+        boundaryStatus.textContent = 'No boundary source is available for this district.';
+        return;
+      }}
+
+      boundaryStatus.textContent = 'Loading district boundaries…';
+      try {{
+        const districtData = await getDistrictPolygons(point[7]);
+        if (requestId !== boundaryRequestId) return;
+        const features = (districtData.mahalla || []).map(parsePolygon).filter(Boolean);
+        if (!features.length) {{
+          boundaryStatus.textContent = 'No mahalla polygons were found for this district.';
+          return;
+        }}
+
+        boundaryLayer = L.geoJSON({{ type: 'FeatureCollection', features }}, {{
+          style: {{ color: '#176b87', weight: 1.2, opacity: 0.9, fillColor: '#41a6c4', fillOpacity: 0.06 }},
+          onEachFeature: (feature, layer) => {{
+            if (feature.properties && feature.properties.name) {{
+              layer.bindPopup(`<b>${{esc(feature.properties.name)}}</b><br>District: ${{esc(districtName)}}`);
+            }}
+          }}
+        }}).addTo(map);
+        const bounds = boundaryLayer.getBounds();
+        if (bounds.isValid()) map.fitBounds(bounds.pad(0.08));
+        boundaryStatus.textContent = `Showing ${{features.length}} mahalla outlines in ${{districtName}}.`;
+      }} catch (error) {{
+        if (requestId === boundaryRequestId) {{
+          boundaryStatus.textContent = 'Could not load district boundaries. Check your internet connection and try again.';
+          console.error('District boundary load failed:', error);
+        }}
+      }}
     }}
 
     function updateSuggestions(searchTerm) {{
@@ -206,19 +353,66 @@ def main() -> None:
           if (item.kind === 'District') {{
             districtSelect.value = item.district;
             searchInput.value = '';
+            clearBoundary();
           }} else {{
             districtSelect.value = item.district;
             searchInput.value = item.name;
           }}
           suggestionsBox.style.display = 'none';
           refreshPoints();
+          if (item.kind === 'Mahalla') showBoundary(item.name, item.district);
+          else showDistrictBoundary(item.district);
         }});
         suggestionsBox.append(button);
       }}
       suggestionsBox.style.display = shown.length ? 'block' : 'none';
     }}
 
+    function renderMahallaList(selectedDistrict, searchTerm = '') {{
+      mahallaNames.replaceChildren();
+      if (selectedDistrict === '__all__') {{
+        mahallaSection.hidden = true;
+        return;
+      }}
+      mahallaSection.hidden = false;
+      const query = normalizeSearch(searchTerm);
+      const seen = new Set();
+      const names = [];
+      for (const point of points) {{
+        const [lat, lon, name, district, status, score, aliases] = point;
+        if (district !== selectedDistrict || seen.has(name)) continue;
+        const searchable = [name, ...aliases].map(normalizeSearch);
+        if (query && !searchable.some(value => value.includes(query))) continue;
+        seen.add(name);
+        names.push(name);
+      }}
+      names.sort((a, b) => a.localeCompare(b));
+      mahallaHeading.textContent = `Mahallas in ${{selectedDistrict}} (${{names.length}})`;
+      if (!names.length) {{
+        const empty = document.createElement('div');
+        empty.className = 'suggestion-detail';
+        empty.textContent = 'No mahallas match this search.';
+        mahallaNames.append(empty);
+        return;
+      }}
+      for (const name of names) {{
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'mahalla-choice';
+        button.textContent = name;
+        button.addEventListener('click', () => {{
+          searchInput.value = name;
+          suggestionsBox.style.display = 'none';
+          refreshPoints();
+          showBoundary(name, selectedDistrict);
+        }});
+        mahallaNames.append(button);
+      }}
+    }}
+
     function showPoints(selectedDistrict, searchTerm = '') {{
+      clearBoundary();
+      renderMahallaList(selectedDistrict, searchTerm);
       pointLayer.clearLayers();
       let visible = 0;
       const matchingLocations = [];
@@ -245,7 +439,10 @@ def main() -> None:
 
     let searchTimer;
     function refreshPoints() {{ showPoints(districtSelect.value, searchInput.value); }}
-    districtSelect.addEventListener('change', refreshPoints);
+    districtSelect.addEventListener('change', () => {{
+      refreshPoints();
+      if (districtSelect.value !== '__all__') showDistrictBoundary(districtSelect.value);
+    }});
     searchInput.addEventListener('input', () => {{
       updateSuggestions(searchInput.value);
       clearTimeout(searchTimer);
