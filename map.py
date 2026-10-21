@@ -171,12 +171,14 @@ def main() -> None:
   <script>
     const points = {payload};
     const map = L.map('map', {{ preferCanvas: true }}).setView([{center_lat}, {center_lon}], 6);
+    map.createPane('mahallaPointsPane');
+    map.getPane('mahallaPointsPane').style.zIndex = '625';
     L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
       maxZoom: 19,
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
     }}).addTo(map);
 
-    const renderer = L.canvas({{ padding: 0.5 }});
+    const renderer = L.canvas({{ padding: 0.5, pane: 'mahallaPointsPane' }});
     const pointLayer = L.featureGroup().addTo(map);
     const districtSelect = document.getElementById('district');
     const searchInput = document.getElementById('search');
@@ -227,14 +229,18 @@ def main() -> None:
     async function getDistrictPolygons(sourceUrl) {{
       const rawUrl = sourceUrl.replace('https://github.com/', 'https://raw.githubusercontent.com/')
         .replace('/blob/', '/');
-      let districtData = boundaryCache.get(rawUrl);
-      if (!districtData) {{
-        const response = await fetch(rawUrl);
-        if (!response.ok) throw new Error(`Boundary request failed (${{response.status}})`);
-        districtData = await response.json();
-        boundaryCache.set(rawUrl, districtData);
+      let request = boundaryCache.get(rawUrl);
+      if (!request) {{
+        request = fetch(rawUrl).then(response => {{
+          if (!response.ok) throw new Error(`Boundary request failed (${{response.status}})`);
+          return response.json();
+        }}).catch(error => {{
+          boundaryCache.delete(rawUrl);
+          throw error;
+        }});
+        boundaryCache.set(rawUrl, request);
       }}
-      return districtData;
+      return await request;
     }}
 
     async function showBoundary(mahallaName, districtName) {{
@@ -320,7 +326,7 @@ def main() -> None:
 
       const matches = [];
       const seen = new Set();
-      for (const [lat, lon, name, district, status, score, aliases] of points) {{
+      for (const [lat, lon, name, district, status, score, aliases, boundaryUrl] of points) {{
         const districtKey = `district|${{district}}`;
         if (!seen.has(districtKey) && normalizeSearch(district).includes(query)) {{
           seen.add(districtKey);
@@ -417,7 +423,7 @@ def main() -> None:
       let visible = 0;
       const matchingLocations = [];
       const query = normalizeSearch(searchTerm);
-      for (const [lat, lon, name, district, status, score, aliases] of points) {{
+      for (const [lat, lon, name, district, status, score, aliases, boundaryUrl] of points) {{
         if (selectedDistrict !== '__all__' && district !== selectedDistrict) continue;
         const searchableNames = [name, district, ...aliases].map(normalizeSearch);
         if (query && !searchableNames.some(value => value.includes(query))) continue;
@@ -427,9 +433,22 @@ def main() -> None:
         if (status) lines.push(`Coordinate status: ${{esc(status)}}`);
         if (score) lines.push(`Match score: ${{esc(score)}}`);
         L.circleMarker([lat, lon], {{
-          renderer, radius: 4, color: '#ffffff', weight: 0.7,
-          fillColor: '#e4572e', fillOpacity: 0.88
-        }}).bindPopup(lines.join('<br>')).bindTooltip(esc(name)).addTo(pointLayer);
+          renderer, pane: 'mahallaPointsPane', radius: 6, color: '#ffffff', weight: 1.2,
+          fillColor: '#e4572e', fillOpacity: 0.95
+        }})
+          .bindPopup(lines.join('<br>'))
+          .bindTooltip(esc(name))
+          .on('mouseover', function() {{
+            map.getContainer().style.cursor = 'pointer';
+            this.setStyle({{ radius: 8, weight: 2, fillOpacity: 1 }});
+            if (boundaryUrl) getDistrictPolygons(boundaryUrl).catch(() => {{}});
+          }})
+          .on('mouseout', function() {{
+            map.getContainer().style.cursor = '';
+            this.setStyle({{ radius: 6, weight: 1.2, fillOpacity: 0.95 }});
+          }})
+          .on('click', () => showBoundary(name, district))
+          .addTo(pointLayer);
       }}
       summary.textContent = `${{visible.toLocaleString()}} of ${{points.length.toLocaleString()}} mahallas`;
       if (query || selectedDistrict !== '__all__') {{
